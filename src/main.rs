@@ -1,9 +1,9 @@
-use std::io::ErrorKind::UnexpectedEof;
+use std::collections::HashMap;
 use std::mem::size_of;
 use tokio::io::{ AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::net::tcp::{ReadHalf, WriteHalf};
-use std::io::Result;
+use std::io::{Error, ErrorKind, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -16,6 +16,11 @@ async fn main() -> Result<()> {
     }
 }
 
+#[derive(Debug)]
+struct ApiKeyAndVersion {
+    api_key: i16,
+    api_version: i16
+}
 
 async fn process(mut client_socket: TcpStream) {
     client_socket.set_nodelay(true).unwrap();
@@ -32,21 +37,29 @@ async fn process(mut client_socket: TcpStream) {
     let mut broker_rd_buf = BufReader::new(broker_rd);
     let mut broker_wr_buf = BufWriter::new(broker_wr);
 
+    let mut requests: HashMap<i32, ApiKeyAndVersion> = HashMap::new();
+
     loop {
         let r = tokio::select! {
             request_size_res = client_rd_buf.read_i32() => {
-                process_request(&mut client_rd_buf, &mut broker_wr_buf, request_size_res).await
+                process_request(
+                    &mut client_rd_buf, &mut broker_wr_buf,
+                    request_size_res, &mut requests
+                ).await
             }
 
             response_size_res = broker_rd_buf.read_i32() => {
-                process_response(&mut client_wr_buf, &mut broker_rd_buf, response_size_res).await
+                process_response(
+                    &mut client_wr_buf, &mut broker_rd_buf,
+                    response_size_res, &mut requests
+                ).await
             }
         };
 
         match r {
             Ok(()) => {},
 
-            Err(e) if e.kind() == UnexpectedEof => {
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
                 client_socket.shutdown().await.unwrap();
                 broker_socket.shutdown().await.unwrap();
                 return;
@@ -64,25 +77,28 @@ async fn process(mut client_socket: TcpStream) {
 
 async fn process_request(client_rd_buf: &mut BufReader<ReadHalf<'_>>,
                          broker_wr_buf: &mut BufWriter<WriteHalf<'_>>,
-                         request_size_res: Result<i32>) -> Result<()> {
+                         request_size_res: Result<i32>,
+                         requests: &mut HashMap<i32, ApiKeyAndVersion>) -> Result<()> {
     let request_size = request_size_res?;
-    let request_api_key = client_rd_buf.read_i16().await?;
-    let request_api_version = client_rd_buf.read_i16().await?;
+    let api_key = client_rd_buf.read_i16().await?;
+    let api_version = client_rd_buf.read_i16().await?;
     let correlation_id = client_rd_buf.read_i32().await?;
 
     println!("Request API key: {}, version: {}, correlation ID: {}",
-             request_api_key, request_api_version, correlation_id);
+             api_key, api_version, correlation_id);
 
     let buf_size = request_size as usize - size_of::<i16>() - size_of::<i16>() - size_of::<i32>();
     let mut buf = vec![0; buf_size];
     client_rd_buf.read_exact(&mut buf).await?;
 
     broker_wr_buf.write_i32(request_size).await?;
-    broker_wr_buf.write_i16(request_api_key).await?;
-    broker_wr_buf.write_i16(request_api_version).await?;
+    broker_wr_buf.write_i16(api_key).await?;
+    broker_wr_buf.write_i16(api_version).await?;
     broker_wr_buf.write_i32(correlation_id).await?;
     broker_wr_buf.write(&buf).await?;
     broker_wr_buf.flush().await?;
+
+    requests.insert(correlation_id, ApiKeyAndVersion { api_key, api_version });
 
     println!("Request proxied");
     Ok(())
@@ -90,12 +106,20 @@ async fn process_request(client_rd_buf: &mut BufReader<ReadHalf<'_>>,
 
 async fn process_response(client_wr_buf: &mut BufWriter<WriteHalf<'_>>,
                           broker_rd_buf: &mut BufReader<ReadHalf<'_>>,
-                          response_size_res: Result<i32>) -> Result<()> {
+                          response_size_res: Result<i32>,
+                          requests: &mut HashMap<i32, ApiKeyAndVersion>) -> Result<()> {
     let response_size = response_size_res?;
     let correlation_id = broker_rd_buf.read_i32().await?;
 
-    println!("Response correlation ID: {}",
-             correlation_id);
+    let (api_key, api_version) = match requests.remove(&correlation_id) {
+        Some(ApiKeyAndVersion{api_key, api_version}) => (api_key, api_version),
+        None => {
+            return Err(Error::new(ErrorKind::InvalidData, format!("correlation ID {} not found", correlation_id)))
+        }
+    };
+
+    println!("Response API key: {}, version: {}, correlation ID: {}",
+             api_key, api_version, correlation_id);
 
     let buf_size = response_size as usize - size_of::<i32>();
     let mut buf = vec![0; buf_size];
