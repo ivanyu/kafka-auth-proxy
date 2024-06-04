@@ -1,0 +1,31 @@
+1. Proxy single Kafka broker without any changes
+2. Proxy two Kafka brokers without any changes
+3. Split directions
+4. While proxying, print details
+
+
+
+Tests:
+
+1. Metadata Response (Version: 0)
+2. Metadata Response (Version: 1)
+3. Metadata Response (Version: 2)
+4. Metadata Response (Version: 3)
+5. Metadata Response (Version: 4)
+6. Metadata Response (Version: 5)
+7. Metadata Response (Version: 6)
+8. Metadata Response (Version: 7)
+9. Metadata Response (Version: 8)
+10. Metadata Response (Version: 9)
+11. Metadata Response (Version: 10)
+12. Metadata Response (Version: 11)
+13. Metadata Response (Version: 12)
+
+14. FindCoordinator Response (Version: 0)
+15. FindCoordinator Response (Version: 1)
+16. FindCoordinator Response (Version: 2)
+17. FindCoordinator Response (Version: 3)
+18. FindCoordinator Response (Version: 4)
+
+19. DescribeCluster Response (Version: 0)
+20. DescribeCluster Response (Version: 1)
