@@ -167,12 +167,8 @@ async fn process_metadata_response(client_wr_buf: &mut BufWriter<WriteHalf<'_>>,
             let (_, bytes_passed) = pass_i32(broker_rd_buf, &mut output_buf).await?;
             rest_size -= bytes_passed;
 
-            // host
-            rest_size -= pass_string(broker_rd_buf, &mut output_buf).await?;
-
-            // port
-            let (_, bytes_passed) = pass_i32(broker_rd_buf, &mut output_buf).await?;
-            rest_size -= bytes_passed;
+            // host and port
+            rest_size -= handle_host_and_port(broker_rd_buf, &mut output_buf).await?;
 
             // rack
             rest_size -= pass_nullable_string(broker_rd_buf, &mut output_buf).await?;
@@ -216,6 +212,7 @@ async fn pass_string(rd: &mut BufReader<ReadHalf<'_>>, buf: &mut Vec<u8>) -> Res
     let host = String::from_utf8(str_buf.clone()).unwrap();
     println!("HOST: {}", host);
 
+    // TODO potentially write directly into output vector
     std::io::Write::write(buf, &str_buf)?;
     size += str_len as usize;
 
@@ -230,10 +227,34 @@ async fn pass_nullable_string(rd: &mut BufReader<ReadHalf<'_>>, buf: &mut Vec<u8
 
     if str_len >= 0 {
         let mut str_buf = vec![0; str_len as usize];
+        // TODO potentially write directly into output vector
         rd.read_exact(&mut str_buf).await?;
         std::io::Write::write(buf, &str_buf)?;
         size += str_len as usize;
     }
+
+    Ok(size)
+}
+
+async fn handle_host_and_port(rd: &mut BufReader<ReadHalf<'_>>, buf: &mut Vec<u8>) -> Result<usize> {
+    let mut size: usize = 0;
+
+    let (host_str_len, bytes_passed) = pass_i16(rd, buf).await?;
+    size += bytes_passed;
+
+    let mut str_buf = vec![0; host_str_len as usize];
+    rd.read_exact(&mut str_buf).await?;
+
+    std::io::Write::write(buf, &str_buf)?;
+    size += host_str_len as usize;
+
+    let port = rd.read_i32().await?;
+    size += size_of_val(&port);
+
+    let host = String::from_utf8(str_buf.clone()).unwrap();
+    println!("HOST: {}:{}", host, port);
+
+    WriteBytesExt::write_i32::<BigEndian>(buf, port)?;
 
     Ok(size)
 }
