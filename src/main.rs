@@ -3,7 +3,7 @@ use std::mem::{size_of, size_of_val};
 use tokio::io::{ AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::net::tcp::{ReadHalf, WriteHalf};
-use std::io::{Error, ErrorKind, Result, Write};
+use std::io::{Cursor, Error, ErrorKind, Result, Write};
 use byteorder::{BigEndian, WriteBytesExt};
 
 #[tokio::main]
@@ -178,11 +178,10 @@ async fn process_metadata_response(client_wr_buf: &mut BufWriter<WriteHalf<'_>>,
             rest_size -= pass_nullable_string(broker_rd_buf, &mut output_buf).await?;
         }
 
+        let block_start = output_buf.len();
+        output_buf.resize(block_start + rest_size, 0);
+        broker_rd_buf.read_exact(&mut output_buf[block_start..]).await?;
         client_wr_buf.write(&output_buf).await?;
-
-        let mut buf = vec![0; rest_size];
-        broker_rd_buf.read_exact(&mut buf).await?;
-        client_wr_buf.write(&buf).await?;
         client_wr_buf.flush().await?;
     } else {
         panic!("Not implemented")
