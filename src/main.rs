@@ -1,9 +1,10 @@
 use std::collections::HashMap;
-use std::mem::size_of;
+use std::mem::{size_of, size_of_val};
 use tokio::io::{ AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::net::tcp::{ReadHalf, WriteHalf};
-use std::io::{Error, ErrorKind, Result};
+use std::io::{Error, ErrorKind, Result, Write};
+use byteorder::{BigEndian, WriteBytesExt};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -21,6 +22,8 @@ struct ApiKeyAndVersion {
     api_key: i16,
     api_version: i16
 }
+
+const METADATA_API_KEY: i16 = 3;
 
 async fn process(mut client_socket: TcpStream) {
     client_socket.set_nodelay(true).unwrap();
@@ -109,7 +112,10 @@ async fn process_response(client_wr_buf: &mut BufWriter<WriteHalf<'_>>,
                           response_size_res: Result<i32>,
                           requests: &mut HashMap<i32, ApiKeyAndVersion>) -> Result<()> {
     let response_size = response_size_res?;
+    let mut buf_size = response_size as usize;
+
     let correlation_id = broker_rd_buf.read_i32().await?;
+    buf_size -= size_of_val(&correlation_id);
 
     let (api_key, api_version) = match requests.remove(&correlation_id) {
         Some(ApiKeyAndVersion{api_key, api_version}) => (api_key, api_version),
@@ -121,14 +127,114 @@ async fn process_response(client_wr_buf: &mut BufWriter<WriteHalf<'_>>,
     println!("Response API key: {}, version: {}, correlation ID: {}",
              api_key, api_version, correlation_id);
 
-    let buf_size = response_size as usize - size_of::<i32>();
-    let mut buf = vec![0; buf_size];
-    broker_rd_buf.read_exact(&mut buf).await?;
     client_wr_buf.write_i32(response_size).await?;
     client_wr_buf.write_i32(correlation_id).await?;
-    client_wr_buf.write(&buf).await?;
-    client_wr_buf.flush().await?;
+    match api_key {
+        METADATA_API_KEY => {
+            process_metadata_response(client_wr_buf, broker_rd_buf, api_version, buf_size).await?;
+        }
 
-    println!("Response proxied");
+        _ => {
+            let mut buf = vec![0; buf_size];
+            broker_rd_buf.read_exact(&mut buf).await?;
+            client_wr_buf.write(&buf).await?;
+            client_wr_buf.flush().await?;
+        }
+    }
+
+    println!("Response proxied\n");
     Ok(())
+}
+
+async fn process_metadata_response(client_wr_buf: &mut BufWriter<WriteHalf<'_>>,
+                                   broker_rd_buf: &mut BufReader<ReadHalf<'_>>,
+                                   api_version: i16,
+                                   mut rest_size: usize) -> Result<()> {
+    // TODO proper reuse, etc.
+    let mut output_buf: Vec<u8> = Vec::with_capacity(rest_size);
+
+    if api_version == 4 {
+        // throttle_time_ms
+        let (_, bytes_passed) = pass_i32(broker_rd_buf, &mut output_buf).await?;
+        rest_size -= bytes_passed;
+
+        // brokers array size
+        let (broker_array_size, bytes_passed) = pass_i32(broker_rd_buf, &mut output_buf).await?;
+        rest_size -= bytes_passed;
+
+        for i in 0..broker_array_size {
+            // node_id
+            let (_, bytes_passed) = pass_i32(broker_rd_buf, &mut output_buf).await?;
+            rest_size -= bytes_passed;
+
+            // host
+            rest_size -= pass_string(broker_rd_buf, &mut output_buf).await?;
+
+            // port
+            let (_, bytes_passed) = pass_i32(broker_rd_buf, &mut output_buf).await?;
+            rest_size -= bytes_passed;
+
+            // rack
+            rest_size -= pass_nullable_string(broker_rd_buf, &mut output_buf).await?;
+        }
+
+        client_wr_buf.write(&output_buf).await?;
+
+        let mut buf = vec![0; rest_size];
+        broker_rd_buf.read_exact(&mut buf).await?;
+        client_wr_buf.write(&buf).await?;
+        client_wr_buf.flush().await?;
+    } else {
+        panic!("Not implemented")
+    }
+
+    Ok(())
+}
+
+async fn pass_i16(rd: &mut BufReader<ReadHalf<'_>>, buf: &mut Vec<u8>) -> Result<(i16, usize)> {
+    let val = rd.read_i16().await?;
+    let size = size_of_val(&val);
+    WriteBytesExt::write_i16::<BigEndian>(buf, val)?;
+    Ok((val, size))
+}
+
+async fn pass_i32(rd: &mut BufReader<ReadHalf<'_>>, buf: &mut Vec<u8>) -> Result<(i32, usize)> {
+    let val = rd.read_i32().await?;
+    let size = size_of_val(&val);
+    WriteBytesExt::write_i32::<BigEndian>(buf, val)?;
+    Ok((val, size))
+}
+
+async fn pass_string(rd: &mut BufReader<ReadHalf<'_>>, buf: &mut Vec<u8>) -> Result<usize> {
+    let mut size: usize = 0;
+
+    let (str_len, bytes_passed) = pass_i16(rd, buf).await?;
+    size += bytes_passed;
+
+    let mut str_buf = vec![0; str_len as usize];
+    rd.read_exact(&mut str_buf).await?;
+
+    let host = String::from_utf8(str_buf.clone()).unwrap();
+    println!("HOST: {}", host);
+
+    std::io::Write::write(buf, &str_buf)?;
+    size += str_len as usize;
+
+    Ok(size)
+}
+
+async fn pass_nullable_string(rd: &mut BufReader<ReadHalf<'_>>, buf: &mut Vec<u8>) -> Result<usize> {
+    let mut size: usize = 0;
+
+    let (str_len, bytes_passed) = pass_i16(rd, buf).await?;
+    size += bytes_passed;
+
+    if str_len >= 0 {
+        let mut str_buf = vec![0; str_len as usize];
+        rd.read_exact(&mut str_buf).await?;
+        std::io::Write::write(buf, &str_buf)?;
+        size += str_len as usize;
+    }
+
+    Ok(size)
 }
