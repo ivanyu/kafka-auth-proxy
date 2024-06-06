@@ -1,0 +1,148 @@
+use std::io::{Cursor, Read, SeekFrom, Write};
+use std::mem::size_of;
+use byteorder::{BigEndian, WriteBytesExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
+
+type HostMapper = fn (&str, u32) -> (&str, u32);
+
+#[tokio::main]
+async fn main() -> tokio::io::Result<()> {
+    Ok(())
+}
+
+async fn transform_metadata_response_v0_1_2(
+    version: u16,
+    input: &mut (impl AsyncRead + Unpin),
+    output: &mut (impl AsyncWrite + Unpin),
+    host_mapper: HostMapper
+) {
+    // TODO capacity
+    let mut output_buf = Vec::<u8>::new();
+    let mut output_buf_cursor = Cursor::new(output_buf);
+
+    let size = input.read_u32().await.unwrap();
+    let mut remain = size as usize;
+    WriteBytesExt::write_u32::<BigEndian>(&mut output_buf_cursor, 0).unwrap(); // size
+
+    let correlation_id = input.read_u32().await.unwrap();
+    remain -= size_of::<u32>();
+    WriteBytesExt::write_u32::<BigEndian>(&mut output_buf_cursor, correlation_id).unwrap();
+
+    const HEADER_VERSION: u16 = 0;  // for API version < 9
+
+    if version >= 3 {
+        let throttle_time_ms = input.read_u32().await.unwrap();
+        remain -= size_of::<u32>();
+        WriteBytesExt::write_u32::<BigEndian>(&mut output_buf_cursor, throttle_time_ms).unwrap();
+    }
+
+    let broker_array_len = input.read_u32().await.unwrap();
+    remain -= size_of::<u32>();
+    WriteBytesExt::write_u32::<BigEndian>(&mut output_buf_cursor, broker_array_len).unwrap();
+
+    let mut new_size = size as usize;
+
+    for _ in 0..broker_array_len {
+        let node_id = input.read_u32().await.unwrap();
+        remain -= size_of::<u32>();
+        WriteBytesExt::write_u32::<BigEndian>(&mut output_buf_cursor, node_id).unwrap();
+
+        let (host, str_bytes) = read_string(input).await;
+        remain -= str_bytes;
+        let port = input.read_u32().await.unwrap();
+        remain -= size_of::<u32>();
+
+        let (new_host, new_port) = host_mapper(&host, port);
+        new_size = new_size - host.len() + new_host.len();
+        write_string(&mut output_buf_cursor, &new_host);
+        WriteBytesExt::write_u32::<BigEndian>(&mut output_buf_cursor, new_port).unwrap();
+
+        if version >= 1 && version < 9 {
+            remain -= transfer_nullable_str(input, &mut output_buf_cursor).await;
+        } else if (version >= 9) {
+            panic!("not implemented");
+        }
+    }
+
+    output_buf_cursor.seek(SeekFrom::Start(0)).await.unwrap();
+    WriteBytesExt::write_u32::<BigEndian>(&mut output_buf_cursor, new_size as u32).unwrap();
+
+    output.write(&*output_buf_cursor.into_inner()).await.unwrap();
+
+    let mut take = input.take(remain as u64);
+    tokio::io::copy(&mut take, output).await.unwrap();
+}
+
+async fn transfer_nullable_str(input: &mut (impl AsyncRead + Unpin), output: &mut impl Write) -> usize {
+    let length = input.read_i16().await.unwrap();
+    WriteBytesExt::write_i16::<BigEndian>(output, length).unwrap();
+    if length >= 0 {
+        let mut buf = vec![0_u8; length as usize];
+        input.read_exact(&mut buf).await.unwrap();
+        output.write(&*buf).unwrap();
+
+        size_of::<i16>() + length as usize
+    } else {
+        size_of::<i16>()
+    }
+}
+
+async fn read_string(input: &mut (impl AsyncRead + Unpin)) -> (String, usize) {
+    let str_len = input.read_i16().await.unwrap();
+    let mut vec = vec![0; str_len as usize];
+    input.read_exact(&mut vec).await.unwrap();
+    let bytes_in_str = vec.len();
+    (String::from_utf8(vec).unwrap(), size_of::<i16>() + bytes_in_str)
+}
+
+fn write_string(output: &mut Cursor<Vec<u8>>, string: &str) {
+    WriteBytesExt::write_i16::<BigEndian>(output, string.len() as i16).unwrap();
+    std::io::Write::write(output, string.as_bytes()).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+    use rstest::rstest;
+    use tokio::fs::File;
+    use tokio::io::AsyncWriteExt;
+    use crate::transform_metadata_response_v0_1_2;
+
+    fn host_mapper(host: &str, port: u32) -> (&str, u32) {
+        match (host, port) {
+            ("host0.remote.com", 9092) => {
+                return ("localhost", 10000);
+            }
+
+            ("host1.remote.com", 9092) => {
+                return ("localhost", 10001);
+            }
+
+            ("host2.remote.com", 9092) => {
+                return ("localhost", 10002);
+            }
+
+            _ => panic!("Unexpected host {}:{}", host, port)
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn metadata_response(#[values(0, 1, 2, 3, 4, 5, 6, 7, 8)] version: u16) -> tokio::io::Result<()> {
+        let original_path = format!("metadata_response_generator/output/MetadataResponse.V{version}.original");
+        let modified_path = format!("metadata_response_generator/output/MetadataResponse.V{version}.modified");
+
+        let mut file = tokio::io::BufReader::new(File::open(original_path).await?);
+
+        let mut expected = Vec::<u8>::new();
+        std::fs::File::open(modified_path)?.read_to_end(&mut expected)?;
+
+        let mut output: Vec<u8> = Vec::new();
+        transform_metadata_response_v0_1_2(version, &mut file, &mut output, host_mapper).await;
+        output.flush().await?;
+
+        assert_eq!(expected, output);
+
+        Ok(())
+    }
+}

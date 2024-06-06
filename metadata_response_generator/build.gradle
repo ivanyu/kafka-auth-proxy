@@ -1,0 +1,19 @@
+plugins {
+    // https://docs.gradle.org/current/userguide/application_plugin.html
+    id 'application'
+
+    // https://docs.gradle.org/current/userguide/idea_plugin.html
+    id 'idea'
+}
+
+application {
+    mainClass = 'me.ivanyu.proxyRENAME.Main'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.apache.kafka:kafka-clients:3.7.0'
+}

@@ -244,15 +244,21 @@ async fn handle_host_and_port(rd: &mut BufReader<ReadHalf<'_>>, buf: &mut Vec<u8
 
     let mut str_buf = vec![0; host_str_len as usize];
     rd.read_exact(&mut str_buf).await?;
-
-    std::io::Write::write(buf, &str_buf)?;
-    size += host_str_len as usize;
+    let host = String::from_utf8(str_buf.clone()).unwrap();
+    if host == "localhost" {
+        let new_host = "127.0.0.1";
+        let new_host_bytes = new_host.as_bytes();
+        std::io::Write::write(buf, new_host_bytes)?;
+        size += new_host_bytes.len();
+    } else {
+        std::io::Write::write(buf, &str_buf)?;
+        size += host_str_len as usize;
+    }
 
     let port = rd.read_i32().await?;
     size += size_of_val(&port);
 
-    let host = String::from_utf8(str_buf.clone()).unwrap();
-    println!("HOST: {}:{}", host, port);
+    // println!("HOST: {}:{}", host, port);
 
     WriteBytesExt::write_i32::<BigEndian>(buf, port)?;
 
